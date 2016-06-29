@@ -24,7 +24,7 @@ object Ingest {
     implicit val sc = SparkUtils.createSparkContext("Tree Canopy ETL", new SparkConf(true))
 
     val sourceBucket = "azavea-datahub"
-    val statewideLayerName = "raw/treecanopy-2006-2008-pennsylvania-albers"
+    val statewideLayerName = "raw/treecanopy-2006-2008-pennsylvania-temp"
     val localLayerName = "raw/treecanopy-pennsylvania-local/harrisburg"
     val localLayerNames = List(
       "raw/treecanopy-pennsylvania-local/abingtons",
@@ -41,52 +41,41 @@ object Ingest {
     val targetLayoutScheme =
       ZoomedLayoutScheme(WebMercator, tileSize)
 
-    // Map 1 to the canopy color and everything else to 0
     val colorMap =
       ColorMap(
         Map(
           0 -> 0x00000000,
-          1 -> 0x139A68FF,
-          Int.MaxValue -> 0x00000000
+          1 -> 0x139A68FF
         )
       )
 
-    val clipTo = Polygon(
-      Point(1257023, 2337147),
-      Point(1257023, 1954954),
-      Point(1793996, 1954954),
-      Point(1793996, 2337147),
-      Point(1257023, 2337147)
-    )
-
-    val maxLocalZoom = 19  // highest zoom level of local datasets
-    val partitioner = new HashPartitioner(5000)
+    val maxLocalZoom = 17
+    val partitioner = new HashPartitioner(20)
 
     try {
-      val raw = loadFromS3(sourceBucket, statewideLayerName, partitioner.numPartitions)
-        .filter { case (key, value) => key.extent.intersects(clipTo) }
-      val (myMaxZoom, tiled) = tile(raw, tileSize, NearestNeighbor, partitioner)
-      val resampled = if (myMaxZoom >= maxLocalZoom) {
-        tiled
-      } else {
-        tiled.resampleToZoom(myMaxZoom, maxLocalZoom, NearestNeighbor)
-      }
-      val statewideLevelStream = Pyramid.levelStream(resampled, targetLayoutScheme, maxLocalZoom, NearestNeighbor)
+      val statewide = loadAndTile(sourceBucket, statewideLayerName, partitioner, maxLocalZoom, tileSize)
+      val statewideLevelStream = Pyramid.levelStream(statewide, targetLayoutScheme, maxLocalZoom, NearestNeighbor)
 
-      val raw2 = loadFromS3(sourceBucket, localLayerName, partitioner.numPartitions)
-      val (myMaxZoom2, tiled2) = tile(raw2, tileSize, NearestNeighbor, partitioner)
-      val resampled2 = if (myMaxZoom2 >= maxLocalZoom) {
-        tiled2
-      } else {
-        tiled2.resampleToZoom(myMaxZoom2, maxLocalZoom, NearestNeighbor)
-      }
-      val localLevelStream = Pyramid.levelStream(resampled2, targetLayoutScheme, maxLocalZoom, NearestNeighbor)
+      val local =
+        loadAndTile(sourceBucket, localLayerName, partitioner, maxLocalZoom, tileSize)
+          .convert(ByteConstantNoDataCellType)
+          .withContext {
+            _.localMap { v =>
+              // Map non-canopy land use types to 0
+              if (isNoData(v)) NODATA
+              else if (v == 1) 1
+              else 0
+            }
+          }
+      val localLevelStream = Pyramid.levelStream(local, targetLayoutScheme, maxLocalZoom, NearestNeighbor)
 
       statewideLevelStream
         .zip(localLevelStream)
         .foreach { case ((z, statewideLayer), (_, localLayer)) =>
           // merge() will add statewide values only where the local value is absent or NODATA
-          val merged = localLayer.merge(statewideLayer)
+          val merged =
+            statewideLayer.leftOuterJoin(localLayer)
+            .updateValues((statewideTile, localTile) => localTile.merge(statewideTile))
 
           val layerId = LayerId(outputName, z)
           val keyToPath = SaveToS3.spatialKeyToPath(layerId, outputPath)
@@ -103,6 +92,18 @@ object Ingest {
     } finally {
       sc.stop()
     }
+  }
+
+  def loadAndTile(sourceBucket: String, rawName: String, partitioner: Partitioner, maxZoom: Int, tileSize: Int)
+                 (implicit sc: SparkContext): TileLayerRDD[SpatialKey] = {
+    val raw = loadFromS3(sourceBucket, rawName, partitioner.numPartitions)
+    val (myMaxZoom, tiled) = tile(raw, tileSize, NearestNeighbor, partitioner)
+    tiled
+//    if (myMaxZoom >= maxZoom) {
+//      tiled
+//    } else {
+//      tiled.resampleToZoom(myMaxZoom, maxZoom, NearestNeighbor)
+//    }
   }
 
   // These functions borrowed from https://github.com/lossyrob/geotrellis-ned-example/blob/master/src/main/scala/elevation/Main.scala
