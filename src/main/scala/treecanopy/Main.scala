@@ -74,8 +74,7 @@ object Ingest {
         .foreach { case ((z, statewideLayer), (_, localLayer)) =>
           // merge() will add statewide values only where the local value is absent or NODATA
           val merged =
-            statewideLayer.leftOuterJoin(localLayer)
-            .updateValues((statewideTile, localTile) => localTile.merge(statewideTile))
+            localLayer.merge(statewideLayer)
 
           val layerId = LayerId(outputName, z)
           val keyToPath = SaveToS3.spatialKeyToPath(layerId, outputPath)
